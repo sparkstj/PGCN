@@ -58,7 +58,7 @@ def main():
 
 
     """construct model"""
-    model = PGCN(model_configs, graph_configs)
+    model = PGCN(model_configs, graph_configs, modality=args.modality, fusion=args.fusion)
     policies = model.get_optim_policies()
     model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
 
@@ -75,11 +75,16 @@ def main():
             logger.info(("=> no checkpoint found at '{}'".format(args.resume)))
 
     """construct dataset"""
+    # TODO: to load diff feature
+    # trainloader gives back input = (batch_size, 2, 168, 1024)
     train_loader = torch.utils.data.DataLoader(
         PGCNDataSet(dataset_configs, graph_configs,
                     prop_file=dataset_configs['train_prop_file'],
                     prop_dict_path=dataset_configs['train_dict_path'],
-                    ft_path=dataset_configs['train_ft_path'],
+                    rgb_ft_path=dataset_configs['train_rgb_ft_path'],
+                    flow_ft_path=dataset_configs['train_flow_ft_path'],
+                    modality=args.modality,
+                    fusion=args.fusion,
                     epoch_multiplier=dataset_configs['training_epoch_multiplier'],
                     test_mode=False),
         batch_size=args.batch_size, shuffle=True,
@@ -89,7 +94,10 @@ def main():
         PGCNDataSet(dataset_configs, graph_configs,
                     prop_file=dataset_configs['test_prop_file'],
                     prop_dict_path=dataset_configs['val_dict_path'],
-                    ft_path=dataset_configs['test_ft_path'],
+                    rgb_ft_path=dataset_configs['test_rgb_ft_path'],
+                    flow_ft_path=dataset_configs['test_flow_ft_path'],
+                    modality=args.modality,
+                    fusion=args.fusion,
                     epoch_multiplier=dataset_configs['testing_epoch_multiplier'],
                     reg_stats=train_loader.dataset.stats,
                     test_mode=False),
@@ -160,9 +168,19 @@ def train(train_loader, model, act_criterion, comp_criterion, regression_criteri
         data_time.update(time.time() - end)
         batch_size = prop_fts[0].size(0)
 
+        # reshape the prop_fts
+        # prop_fts = activity_fts, completeness_fts
+        activity_fts = list()
+        completeness_fts = list()
+        for i in range(prop_fts[0].shape[1]):
+            activity_fts.append(prop_fts[0][:,i,:,:])
+            completeness_fts.append(prop_fts[1][:,i,:,:])
+        activity_fts = torch.stack(activity_fts).squeeze()
+        completeness_fts = torch.stack(completeness_fts).squeeze()
+
         activity_out, activity_target, activity_prop_type, \
         completeness_out, completeness_target, \
-        regression_out, regression_labels, regression_target = model((prop_fts[0], prop_fts[1]), prop_labels,
+        regression_out, regression_labels, regression_target = model((activity_fts, completeness_fts), prop_labels,
                                                                      prop_reg_targets, prop_type)
 
         act_loss = act_criterion(activity_out, activity_target)

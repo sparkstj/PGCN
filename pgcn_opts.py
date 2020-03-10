@@ -1,12 +1,16 @@
 import argparse
 parser = argparse.ArgumentParser(description="PyTorch code to train PGCN")
-parser.add_argument('dataset', type=str, choices=['activitynet1.3', 'thumos14'])
+parser.add_argument('dataset', type=str, choices=['activitynet1.3', 'thumos14', 'hacs-segments'])
 
 # ========================= Model Configs ==========================
 parser.add_argument('--dropout', '--do', default=0.8, type=float,
                     metavar='DO', help='dropout ratio (default: 0.8)')
 
 # ========================= Learning Configs ==========================
+parser.add_argument('--modality', type=str, choices=['RGB', 'Flow', 'TwoStream'], 
+                    help='video feature extraction modality')
+parser.add_argument('--fusion', type=str, choices=['early', 'late', None],
+                    help='fusion timing')
 parser.add_argument('--epochs', default=70, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--training_epoch_multiplier', '--tem', default=10, type=int,

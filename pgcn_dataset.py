@@ -136,12 +136,15 @@ class PGCNVideoRecord:
 
 class PGCNDataSet(data.Dataset):
 
-    def __init__(self, dataset_configs, graph_configs, prop_file, prop_dict_path, ft_path, exclude_empty=True,
+    def __init__(self, dataset_configs, graph_configs, prop_file, prop_dict_path, rgb_ft_path, flow_ft_path, modality, fusion, exclude_empty=True,
                  epoch_multiplier=1, test_mode=False, gt_as_fg=True, reg_stats=None):
 
-        self.ft_path = ft_path
+        self.rgb_ft_path = rgb_ft_path
+        self.flow_ft_path = flow_ft_path
         self.prop_file = prop_file
         self.prop_dict_path = prop_dict_path
+        self.modality = modality
+        self.fusion = fusion
 
         self.exclude_empty = exclude_empty
         self.epoch_multiplier = epoch_multiplier
@@ -506,7 +509,19 @@ class PGCNDataSet(data.Dataset):
         vid_full_name = video.id
         vid = vid_full_name.split('/')[-1]
 
-        act_prop_ft, comp_prop_ft = I3D_Pooling(out_prop_ind, vid, self.ft_path, video.num_frames)
+        # TODO: read features
+        if self.modality == 'TwoStream':
+            rgb_act_prop_ft, rgb_comp_prop_ft = I3D_Pooling(out_prop_ind, vid, self.rgb_ft_path, video.num_frames)
+            flow_act_prop_ft, flow_comp_prop_ft = I3D_Pooling(out_prop_ind, vid, self.flow_ft_path, video.num_frames)
+            act_prop_ft = torch.stack([rgb_act_prop_ft, flow_act_prop_ft])
+            comp_prop_ft = torch.stack([rgb_comp_prop_ft, flow_comp_prop_ft])
+            if self.fusion == 'early':
+                act_prop_ft = act_prop_ft.mean(dim=0, keepdim=True).squeeze()
+                comp_prop_ft = comp_prop_ft.mean(dim=0, keepdim=True).squeeze()
+        elif self.modality == 'RGB':
+            act_prop_ft, comp_prop_ft = I3D_Pooling(out_prop_ind, vid, self.rgb_ft_path, video.num_frames)
+        elif self.modality == 'Flow':
+            act_prop_ft, comp_prop_ft = I3D_Pooling(out_prop_ind, vid, self.flow_ft_path, video.num_frames)
 
         return (act_prop_ft, comp_prop_ft), out_prop_type, out_prop_labels, out_prop_reg_targets
 

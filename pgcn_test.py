@@ -23,6 +23,10 @@ parser.add_argument('--max_num', type=int, default=-1)
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--gpus', nargs='+', type=int, default=None)
+parser.add_argument('--modality', type=str, choices=['RGB', 'Flow', 'TwoStream'], 
+                    help='video feature extraction modality')
+parser.add_argument('--fusion', type=str, choices=['early', 'late', None],
+                    help='fusion timing')
 
 SEED = 777
 random.seed(SEED)
@@ -114,7 +118,7 @@ def get_adjacent_batch(prop_idx, iou_dict, dis_dict):
 def runner_func(dataset, state_dict, stats, gpu_id, index_queue, result_queue, iou_dict, dis_dict):
 
     torch.cuda.set_device(gpu_id)
-    net = PGCN(model_configs, graph_configs, test_mode=True)
+    net = PGCN(model_configs, graph_configs, modality=args.modality, fusion=args.fusion, test_mode=True)
     net.load_state_dict(state_dict)
     # net.prepare_test_fc()
     net.eval()
@@ -139,7 +143,23 @@ def runner_func(dataset, state_dict, stats, gpu_id, index_queue, result_queue, i
         vid_full_name = video_id
         vid = vid_full_name.split('/')[-1]
 
-        act_all_fts, comp_all_fts = I3D_Pooling(prop_ticks, vid, dataset_configs['test_ft_path'], n_frames)
+        # TODO: read test features
+        rgb_ft_path = dataset_configs['test_rgb_ft_path'],
+        flow_ft_path = dataset_configs['test_flow_ft_path'],
+        if args.modality == 'TwoStream':
+            rgb_act_all_fts, rgb_comp_all_fts = I3D_Pooling(prop_ticks, vid, rgb_ft_path, n_frames)
+            flow_act_all_fts, flow_comp_all_fts = I3D_Pooling(prop_ticks, vid, flow_ft_path, n_frames)
+            act_all_fts = torch.stack([rgb_act_all_fts, flow_act_all_fts])
+            comp_all_fts = torch.stack([rgb_comp_all_fts, flow_comp_all_fts])
+            if args.fusion == 'early':
+                act_prop_ft = act_prop_ft.mean(dim=0, keepdim=True).squeeze()
+                comp_prop_ft = comp_prop_ft.mean(dim=0, keepdim=True).squeeze()
+        elif args.modality == 'RGB':
+            act_all_fts, comp_all_fts = I3D_Pooling(prop_ticks, vid, rgb_ft_path, n_frames)
+        elif args.modality == 'Flow':
+            act_all_fts, comp_all_fts = I3D_Pooling(prop_ticks, vid, flow_ft_path, n_frames)
+        
+        # act_all_fts, comp_all_fts = I3D_Pooling(prop_ticks, vid, ft_path, n_frames)
 
         for prop_idx, prop in enumerate(prop_ticks):
             if prop_idx >= n_out:
@@ -185,7 +205,10 @@ if __name__ == '__main__':
     dataset = PGCNDataSet(dataset_configs, graph_configs,
                           prop_file=dataset_configs['test_prop_file'],
                           prop_dict_path=dataset_configs['test_dict_path'],
-                          ft_path=dataset_configs['test_ft_path'],
+                          rgb_ft_path=dataset_configs['test_rgb_ft_path'],
+                          flow_ft_path=dataset_configs['test_flow_ft_path'],
+                          modality=args.modality,
+                          fusion=args.fusion,
                           test_mode=True)
 
     iou_dict = dataset.act_iou_dict

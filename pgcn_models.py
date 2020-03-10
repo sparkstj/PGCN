@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 import math
-
+from ops.consensus import ConsensusModule
 
 class GraphConvolution(nn.Module):
     """
@@ -60,7 +60,7 @@ class GCN(nn.Module):
 
 
 class PGCN(torch.nn.Module):
-    def __init__(self, model_configs, graph_configs, test_mode=False):
+    def __init__(self, model_configs, graph_configs, modality, fusion, test_mode=False):
         super(PGCN, self).__init__()
 
         self.num_class = model_configs['num_class']
@@ -72,6 +72,14 @@ class PGCN(torch.nn.Module):
         self.test_mode = test_mode
         self.act_feat_dim = model_configs['act_feat_dim']
         self.comp_feat_dim = model_configs['comp_feat_dim']
+
+        self.modality = modality
+        self.fusion = fusion
+        if self.modality == 'TwoStream' and self.fusion == 'late':
+            consensus_type = 'avg'
+        else:
+            consensus_type = 'identity'
+        self.consensus = ConsensusModule(consensus_type)
 
         self._prepare_pgcn()
         self.Act_GCN = GCN(self.act_feat_dim, 512, self.act_feat_dim, dropout=model_configs['gcn_dropout'])
@@ -90,7 +98,6 @@ class PGCN(torch.nn.Module):
         nn.init.constant_(self.completeness_fc.bias.data, 0)
         nn.init.normal_(self.regressor_fc.weight.data, 0, 0.001)
         nn.init.constant_(self.regressor_fc.bias.data, 0)
-
 
     def train(self, mode=True):
 
@@ -125,22 +132,15 @@ class PGCN(torch.nn.Module):
         ]
 
     def forward(self, input, target, reg_target, prop_type):
+
         if not self.test_mode:
             return self.train_forward(input, target, reg_target, prop_type)
         else:
             return self.test_forward(input)
 
 
-    def train_forward(self, input, target, reg_target, prop_type):
-
-        activity_fts = input[0]
-        completeness_fts = input[1]
-        batch_size = activity_fts.size()[0]
-
-        # construct feature matrix
-        act_ft_mat = activity_fts.view(-1, self.act_feat_dim).contiguous()
-        comp_ft_mat = completeness_fts.view(-1, self.comp_feat_dim).contiguous()
-
+    def get_adjacent_matrix(self, act_ft_mat, comp_ft_mat):
+        
         # act cosine similarity
         dot_product_mat = torch.mm(act_ft_mat, torch.transpose(act_ft_mat, 0, 1))
         len_vec = torch.unsqueeze(torch.sqrt(torch.sum(act_ft_mat * act_ft_mat, dim=1)), dim=0)
@@ -171,6 +171,20 @@ class PGCN(torch.nn.Module):
         # normalized by the number of nodes
         act_adj_mat = F.relu(act_adj_mat)
         comp_adj_mat = F.relu(comp_adj_mat)
+        
+        return act_adj_mat, comp_adj_mat
+
+    def train_gcn(self, input):
+
+        activity_fts, completeness_fts = input
+        
+        batch_size = activity_fts_list[0].size()[0]
+
+        # construct feature matrix
+        act_ft_mat = activity_fts.view(-1, self.act_feat_dim).contiguous()
+        comp_ft_mat = completeness_fts.view(-1, self.comp_feat_dim).contiguous()
+
+        act_adj_mat, comp_adj_mat = self.get_adjacent_matrix(act_ft_mat, comp_ft_mat)
 
         act_gcn_ft = self.Act_GCN(act_ft_mat, act_adj_mat)
         comp_gcn_ft = self.Comp_GCN(comp_ft_mat, comp_adj_mat)
@@ -181,6 +195,21 @@ class PGCN(torch.nn.Module):
 
         out_comp_fts = torch.cat((comp_gcn_ft, comp_ft_mat), dim=-1)
         comp_fts = out_comp_fts[:-1: self.adj_num, :]
+
+        return act_fts, comp_fts
+
+    def train_forward(self, input, target, reg_target, prop_type):
+        
+        act_fts = []
+        comp_fts = []
+
+        for item in input:
+            act_ft, comp_ft = self.train_gcn(item)
+            act_fts.append(act_ft)
+            comp_fts.append(comp_ft)
+        
+        act_fts = self.consensus(torch.stack(act_fts).squeeze()).squeeze()
+        comp_fts = self.consensus(torch.stack(comp_fts).squeeze()).squeeze()
 
         raw_act_fc = self.activity_fc(act_fts)
         raw_comp_fc = self.completeness_fc(comp_fts)
@@ -209,54 +238,17 @@ class PGCN(torch.nn.Module):
               raw_regress_fc[reg_indexer, :, :], target[reg_indexer], reg_target[reg_indexer, :]
 
     def test_forward(self, input):
+        
+        act_fts = []
+        comp_fts = []
 
-        activity_fts = input[0]
-        completeness_fts = input[1]
-        batch_size = activity_fts.size()[0]
-
-        # construct feature matrix
-        act_ft_mat = activity_fts.view(-1, self.act_feat_dim).contiguous()
-        comp_ft_mat = completeness_fts.view(-1, self.comp_feat_dim).contiguous()
-
-        # act cosine similarity
-        dot_product_mat = torch.mm(act_ft_mat, torch.transpose(act_ft_mat, 0, 1))
-        len_vec = torch.unsqueeze(torch.sqrt(torch.sum(act_ft_mat * act_ft_mat, dim=1)), dim=0)
-        len_mat = torch.mm(torch.transpose(len_vec, 0, 1), len_vec)
-        act_cos_sim_mat = dot_product_mat / len_mat
-
-        # comp cosine similarity
-        dot_product_mat = torch.mm(comp_ft_mat, torch.transpose(comp_ft_mat, 0, 1))
-        len_vec = torch.unsqueeze(torch.sqrt(torch.sum(comp_ft_mat * comp_ft_mat, dim=1)), dim=0)
-        len_mat = torch.mm(torch.transpose(len_vec, 0, 1), len_vec)
-        comp_cos_sim_mat = dot_product_mat / len_mat
-
-        mask = act_ft_mat.new_zeros(self.adj_num, self.adj_num)
-        for stage_cnt in range(self.child_num + 1):
-            ind_list = list(range(1 + stage_cnt * self.child_num, 1 + (stage_cnt + 1) * self.child_num))
-            for i, ind in enumerate(ind_list):
-                mask[stage_cnt, ind] = 1 / self.child_num
-            mask[stage_cnt, stage_cnt] = 1
-
-        mask_mat_var = act_ft_mat.new_zeros(act_ft_mat.size()[0], act_ft_mat.size()[0])
-        for row in range(int(act_ft_mat.size(0)/ self.adj_num)):
-            mask_mat_var[row * self.adj_num: (row + 1) * self.adj_num, row * self.adj_num: (row + 1) * self.adj_num] \
-                = mask
-
-        act_adj_mat = mask_mat_var * act_cos_sim_mat
-        comp_adj_mat = mask_mat_var * comp_cos_sim_mat
-
-        # normalized by the number of nodes
-        act_adj_mat = F.relu(act_adj_mat)
-        comp_adj_mat = F.relu(comp_adj_mat)
-
-        act_gcn_ft = self.Act_GCN(act_ft_mat, act_adj_mat)
-        comp_gcn_ft = self.Comp_GCN(comp_ft_mat, comp_adj_mat)
-
-        out_act_fts = torch.cat((act_gcn_ft, act_ft_mat), dim=-1)
-        act_fts = out_act_fts[:-1: self.adj_num, :]
-
-        out_comp_fts = torch.cat((comp_gcn_ft, comp_ft_mat), dim=-1)
-        comp_fts = out_comp_fts[:-1: self.adj_num, :]
+        for item in input:
+            act_ft, comp_ft = self.train_gcn(item)
+            act_fts.append(act_ft)
+            comp_fts.append(comp_ft)
+        
+        act_fts = self.consensus(torch.stack(act_fts).squeeze()).squeeze()
+        comp_fts = self.consensus(torch.stack(comp_fts).squeeze()).squeeze()
 
         raw_act_fc = self.activity_fc(act_fts)
         raw_comp_fc = self.completeness_fc(comp_fts)
